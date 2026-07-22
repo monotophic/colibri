@@ -55,9 +55,9 @@ static uint8_t rndbyte_nonan(void){
  * cases, fork+waitpid for refusing ones -- qt_resolve_fmt exit(1)s in place,
  * it does not return an error code). ---- */
 
-static int expect_fmt(int O, int I, int64_t nb, int64_t ns, int expect_fmt_val, const char *tag){
+static int expect_fmt_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, int expect_fmt_val, const char *tag){
     int gs=0;
-    int fmt = qt_resolve_fmt(tag, O, I, nb, ns, &gs);
+    int fmt = qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name);
     if(fmt != expect_fmt_val){
         printf("FAIL %s: got fmt=%d, expected fmt=%d (O=%d I=%d nb=%lld ns=%lld)\n",
                tag, fmt, expect_fmt_val, O, I, (long long)nb, (long long)ns);
@@ -65,15 +65,18 @@ static int expect_fmt(int O, int I, int64_t nb, int64_t ns, int expect_fmt_val, 
     }
     return 1;
 }
+static int expect_fmt(int O, int I, int64_t nb, int64_t ns, int expect_fmt_val, const char *tag){
+    return expect_fmt_stamped(O, I, nb, ns, NULL, expect_fmt_val, tag);
+}
 
-static int expect_refuse(int O, int I, int64_t nb, int64_t ns, const char *tag){
+static int expect_refuse_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, const char *tag){
     int pipefd[2]; if(pipe(pipefd)!=0) return 0;
     pid_t pid = fork();
     if(pid < 0) return 0;
     if(pid == 0){
         dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
         int gs=0;
-        qt_resolve_fmt(tag, O, I, nb, ns, &gs);   /* must exit(1) inside; must NOT return */
+        qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name);   /* must exit(1) inside; must NOT return */
         _exit(42);                                  /* reaching here is the bug */
     }
     close(pipefd[1]);
@@ -90,6 +93,9 @@ static int expect_refuse(int O, int I, int64_t nb, int64_t ns, const char *tag){
         return 0;
     }
     return 1;
+}
+static int expect_refuse(int O, int I, int64_t nb, int64_t ns, const char *tag){
+    return expect_refuse_stamped(O, I, nb, ns, NULL, tag);
 }
 
 static void test_disambiguation(void){

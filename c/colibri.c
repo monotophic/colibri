@@ -1070,14 +1070,61 @@ static int detect_group_size(int O, int I, int64_t ns){
     return 0;
 }
 
+/* FORMAT NAME <-> internal fmt-int table. The NAME is the public identity a
+ * container or a Feature Request advertises; the int on the right is this
+ * BUILD's internal enum value only and is never itself persisted to a
+ * container (PRIVATE ORDINAL BLOCK convention, see the QT struct comment
+ * above qt_bytes). Covers every format qt_resolve_fmt can return, not just
+ * the one this branch's tool stamps: a single-entry table could only ever
+ * exercise the "unrecognized name" refusal path, never a genuine
+ * recognized-but-different-format mismatch, and would leave the upstream
+ * formats unnamed for FORMATS_registry_draft.md to cite. These strings are
+ * the SAME identifiers that draft's table uses (upstream_contribution/
+ * FORMATS_registry_draft.md) -- keep the two in sync if either changes.
+ * "e8-iq3-lattice" is this build's own placeholder name for dev's upstream
+ * fmt=6 (#465 never stamped containers -- dev has no metadata-stamp feature
+ * of its own, see st.h) -- listed so qt_fmt_by_name/qt_name_by_fmt are total
+ * over every value qt_resolve_fmt can return, matching this comment's own
+ * claim; a real name for fmt=6 belongs to whoever upstreams a stamp for it.
+ * Placed BEFORE qt_resolve_fmt (not after, where it first landed) because
+ * qt_resolve_fmt itself now consults it -- see THE DESIGN LANDMINE branch
+ * below, "metadata stamp resolves the collision". */
+static const struct { const char *name; int fmt; } FMT_NAMES[] = {
+    { "f32",           0 },
+    { "int8-row",      1 },
+    { "int4-row",      2 },
+    { "int2-row",      3 },
+    { "int4-grouped",  4 },
+    { "int3-g64",      5 },
+    { "e8-iq3-lattice", 6 },
+    { "fp8-e4m3-b128", 100 },
+};
+#define N_FMT_NAMES (int)(sizeof(FMT_NAMES)/sizeof(FMT_NAMES[0]))
+
+static int qt_fmt_by_name(const char *name){
+    for(int i=0;i<N_FMT_NAMES;i++) if(!strcmp(FMT_NAMES[i].name,name)) return FMT_NAMES[i].fmt;
+    return -1;   /* unrecognized name -- never a valid qt_resolve_fmt() return value */
+}
+static const char *qt_name_by_fmt(int fmt){
+    for(int i=0;i<N_FMT_NAMES;i++) if(FMT_NAMES[i].fmt==fmt) return FMT_NAMES[i].name;
+    return NULL; /* fmt has no registered public name yet (e.g. upstream 0-5) */
+}
+
 /* SEC: risolve e VALIDA il formato quantizzato di un tensore [O,I] letto da un
  * container non fidato (mirror). L'inferenza precedente (`?1:?2:3`) cadeva su
  * int2 per QUALSIASI conteggio byte non riconosciuto: un peso troppo corto
  * diventava un int2 valido e il matmul leggeva oltre il buffer (O*I nibble a
  * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
  * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
- * si termina invece di sforare. Ritorna fmt (1/2/3/4/5/6/100) e scrive *gs. */
-static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
+ * si termina invece di sforare. Ritorna fmt (1/2/3/4/5/6/100) e scrive *gs.
+ * `stamped_name`: the tensor's __metadata__ format-NAME stamp if the caller
+ * looked one up (st_fmt_stamp, st.h), else NULL -- used ONLY to break a
+ * genuine byte-count collision (see THE DESIGN LANDMINE below); every other
+ * decision in this function is byte-arithmetic alone, unchanged by whether a
+ * stamp is present. Routed-expert callers (expert_load_impl and friends)
+ * always pass NULL: this branch's repack tool never stamps routed experts,
+ * so there is nothing for those paths to consult. */
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs, const char *stamped_name){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
@@ -1106,18 +1153,35 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * conventions at once. Guessing either way risks silently reading a
      * genuine per-row-int8 tensor as block-scaled FP8 (or vice versa), which
      * would corrupt every weight without any error. Refuse instead (same
-     * "untrusted container" discipline as the rest of this function). */
+     * "untrusted container" discipline as the rest of this function) -- UNLESS
+     * a metadata stamp is present and names exactly one of the two colliding
+     * candidates (int8-row or fp8-e4m3-b128): the stamp is then the ONLY
+     * thing that can resolve a byte-collision of this kind (bytes alone are
+     * fundamentally ambiguous here), so it stops being a mere after-the-fact
+     * cross-check and becomes load-bearing. qt_verify_fmt_stamp (the caller's
+     * post-check) will trivially re-confirm agreement in this case -- fmt was
+     * just set FROM the same stamp it re-checks against. A stamp naming
+     * anything else (unrecognized, or a format that isn't one of the two
+     * candidates) does NOT resolve the ambiguity and falls through to the
+     * same refusal as an absent stamp. */
     if(fmt==1){
         int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I);
         int64_t ns_row=(int64_t)O*4, ns_blk=nblkO*nblkI*4;
         int is_row=(ns==ns_row), is_blk=(ns==ns_blk);
         if(is_row && is_blk){
-            fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
-                "int8 (fmt=1) and per-128x128-block FP8 (fmt=100) scale geometry; refusing "
-                "rather than guessing (untrusted container, THE DESIGN LANDMINE)\n",
-                name,O,I,(long long)ns); exit(1);
-        }
-        if(is_blk && !is_row) fmt=100;
+            int sf = stamped_name ? qt_fmt_by_name(stamped_name) : -1;
+            if(sf==1 || sf==100){
+                fmt = sf;
+            } else {
+                fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
+                    "int8 (fmt=1) and per-128x128-block FP8 (fmt=100) scale geometry; refusing "
+                    "rather than guessing (untrusted container, THE DESIGN LANDMINE)%s\n",
+                    name,O,I,(long long)ns,
+                    stamped_name ? " -- metadata stamp present but names a format that doesn't resolve the ambiguity"
+                                 : "");
+                exit(1);
+            }
+        } else if(is_blk && !is_row) fmt=100;
     }
     int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs))
                       : (fmt==5)? (int64_t)O*i3_groups(I)
@@ -1129,55 +1193,24 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
     return fmt;
 }
 
-/* FORMAT NAME <-> internal fmt-int table. The NAME is the public identity a
- * container or a Feature Request advertises; the int on the right is this
- * BUILD's internal enum value only and is never itself persisted to a
- * container (PRIVATE ORDINAL BLOCK convention, see the QT struct comment
- * above qt_bytes). Covers every format qt_resolve_fmt can return, not just
- * the one this branch's tool stamps: a single-entry table could only ever
- * exercise the "unrecognized name" refusal path, never a genuine
- * recognized-but-different-format mismatch, and would leave the upstream
- * formats unnamed for FORMATS_registry_draft.md to cite. These strings are
- * the SAME identifiers that draft's table uses (upstream_contribution/
- * FORMATS_registry_draft.md) -- keep the two in sync if either changes.
- * "e8-iq3-lattice" is this build's own placeholder name for dev's upstream
- * fmt=6 (#465 never stamped containers -- dev has no metadata-stamp feature
- * of its own, see st.h) -- listed so qt_fmt_by_name/qt_name_by_fmt are total
- * over every value qt_resolve_fmt can return, matching this comment's own
- * claim; a real name for fmt=6 belongs to whoever upstreams a stamp for it. */
-static const struct { const char *name; int fmt; } FMT_NAMES[] = {
-    { "f32",           0 },
-    { "int8-row",      1 },
-    { "int4-row",      2 },
-    { "int2-row",      3 },
-    { "int4-grouped",  4 },
-    { "int3-g64",      5 },
-    { "e8-iq3-lattice", 6 },
-    { "fp8-e4m3-b128", 100 },
-};
-#define N_FMT_NAMES (int)(sizeof(FMT_NAMES)/sizeof(FMT_NAMES[0]))
-
-static int qt_fmt_by_name(const char *name){
-    for(int i=0;i<N_FMT_NAMES;i++) if(!strcmp(FMT_NAMES[i].name,name)) return FMT_NAMES[i].fmt;
-    return -1;   /* unrecognized name -- never a valid qt_resolve_fmt() return value */
-}
-static const char *qt_name_by_fmt(int fmt){
-    for(int i=0;i<N_FMT_NAMES;i++) if(FMT_NAMES[i].fmt==fmt) return FMT_NAMES[i].name;
-    return NULL; /* fmt has no registered public name yet (e.g. upstream 0-5) */
-}
-
-/* TRUST-VERIFY-REFUSE: if `name` carries a __metadata__ format stamp (see
- * st_fmt_stamp/st_fmt_stamp_ingest in st.h), verify it agrees with `fmt` (the
- * byte-arithmetic inference qt_resolve_fmt just computed above) and refuse
- * loudly on disagreement -- same "untrusted container" discipline
- * qt_resolve_fmt itself applies throughout this function. A stamp naming a
+/* TRUST-VERIFY-REFUSE: if `stamped` (the tensor's __metadata__ format-NAME
+ * stamp, or NULL if none -- see st_fmt_stamp/st_fmt_stamp_ingest in st.h)
+ * is present, verify it agrees with `fmt` (qt_resolve_fmt's byte-arithmetic
+ * result, ALREADY stamp-aware for the one ambiguous case -- see THE DESIGN
+ * LANDMINE above) and refuse loudly on disagreement -- same "untrusted
+ * container" discipline qt_resolve_fmt applies throughout. A stamp naming a
  * format this build doesn't recognize is ALSO a refusal: silently accepting
  * an unrecognized name would be indistinguishable from missing a real
  * mismatch, and "refuse rather than guess" is the whole point of this
  * function's design. No stamp at all is NOT an error -- the container simply
  * predates this feature (or was never stamped by a stamping tool), and
  * byte-arithmetic inference alone decides, exactly as before this function
- * existed: zero behavior change for unstamped containers.
+ * existed: zero behavior change for unstamped containers. For the one case
+ * where the stamp already broke a genuine byte-collision inside
+ * qt_resolve_fmt, this is a trivial re-confirmation (stamped_fmt==fmt by
+ * construction) -- belt-and-braces, not redundant plumbing: it's the same
+ * "verify agreement" check running uniformly for every tensor, ambiguous or
+ * not, rather than a special case the ambiguous path gets to skip.
  *
  * Called from qt_from_disk right after qt_resolve_fmt -- the resident-tensor
  * load path this branch's repack tool actually stamps. Deliberately NOT
@@ -1188,8 +1221,7 @@ static const char *qt_name_by_fmt(int fmt){
  * no stamp for those paths to verify yet -- adding the plumbing there now
  * would be framework-building ahead of any container that needs it, which
  * this reference implementation deliberately avoids. */
-static void qt_verify_fmt_stamp(shards *S, const char *name, int fmt){
-    const char *stamped = st_fmt_stamp(S,name);
+static void qt_verify_fmt_stamp(const char *name, const char *stamped, int fmt){
     if(!stamped) return;                       /* unstamped: infer exactly as today */
     int stamped_fmt = qt_fmt_by_name(stamped);
     if(stamped_fmt == fmt) return;              /* agree: silent pass-through, loads normally */
@@ -1221,8 +1253,9 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
          * non fidati (SEC). */
         int gs=0;
-        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
-        qt_verify_fmt_stamp(&m->S,name,fmt);   /* TRUST-VERIFY-REFUSE: no-op if unstamped */
+        const char *stamped = st_fmt_stamp(&m->S,name);   /* NULL if unstamped */
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs,stamped);
+        qt_verify_fmt_stamp(name,stamped,fmt);   /* TRUST-VERIFY-REFUSE: no-op if unstamped */
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -1702,7 +1735,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
-                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+                /* stamped_name=NULL: routed experts (g/u/d) are never stamped by this
+                 * branch's repack tool (kind "x" excluded) -- see qt_resolve_fmt's own
+                 * doc comment. */
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -1864,7 +1900,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+        /* stamped_name=NULL: routed experts, never stamped -- see qt_resolve_fmt's doc comment. */
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
@@ -2056,9 +2093,10 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         fp[k]=s->fslab+fo; fo+=l->tq[k]->nbytes/4;
         int64_t nb=l->tw[k]->nbytes;
         /* qt_resolve_fmt like the other two expert paths: the raw ?1:?2:3 inference here
-         * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2. */
+         * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2.
+         * stamped_name=NULL: routed experts, never stamped -- see qt_resolve_fmt's doc comment. */
         int gs=0;
-        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs);
+        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs,NULL);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
