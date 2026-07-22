@@ -1129,8 +1129,49 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
      * convention is kept with a single-float tag — ns==4 is the discriminator
-     * (every other format carries at least O floats of real scales). */
-    if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){ *gs=0; return 6; }
+     * (every other format carries at least O floats of real scales).
+     *
+     * SECOND DESIGN LANDMINE, found reconciling this branch's fmt=100 onto dev
+     * post-#465 (see the build report's "THE SEMANTIC RECONCILIATION" section
+     * for the full derivation): e8_rowbytes(I) = ceil(I/256)*98 is the constant
+     * 98 for every I in (0,256], so this check's nb==O*e8_rowbytes(I) collapses
+     * to nb==O*98 -- which is ALSO fp8-e4m3-b128's raw-byte weight count
+     * (O*I) at the ONE value of I where I itself equals 98 (the only I in
+     * (0,256] with ceil(I/256)*98==I; solving 98k==I for I in ((k-1)*256,k*256]
+     * only admits k=1, I=98). At that same I=98, a SINGLE-BLOCK fp8 tensor
+     * (O<=128, so fp8_nblk(O)==1) also carries exactly ONE f32 block scale --
+     * ns==4, same as this check's own tag. So an unstamped [O<=128, I=98]
+     * fp8-e4m3-b128 tensor is byte-for-byte indistinguishable from a genuine
+     * fmt=6 tensor at the same shape: both nb AND ns coincide, not just ns.
+     * O==1 stacks a THIRD candidate on top: fmt=1's per-row ns (O*4) is also
+     * 4 there, so the plain-int8 interpretation is live too. Silently letting
+     * this check win unconditionally (as a straight rebase onto dev would --
+     * RAN, see the report's fail-before evidence) would misread every
+     * fmt=100 (or, at O==1, fmt=1) weight in the tensor as E8/IQ3-lattice-
+     * decoded garbage with no error. Refuse instead, unless a stamp names
+     * exactly one of the live candidates -- same discipline as THE DESIGN
+     * LANDMINE below, applied one layer earlier because this collision must
+     * be caught BEFORE the unconditional `return 6`, not after it. */
+    if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){
+        int fp8_blk_also = (nb==(int64_t)O*I) && (fp8_nblk(O)*fp8_nblk(I)==1);
+        int i8_row_also  = (nb==(int64_t)O*I) && (O==1);   /* ns==O*4==4 iff O==1 */
+        if(fp8_blk_also || i8_row_also){
+            int sf = stamped_name ? qt_fmt_by_name(stamped_name) : -1;
+            if(sf==6){ *gs=0; return 6; }
+            if(sf==100 && fp8_blk_also){ *gs=0; return 100; }
+            if(sf==1 && i8_row_also){ *gs=0; return 1; }
+            fprintf(stderr,"%s: [%d,%d] byte layout (nb=%lld ns=%lld) matches E8/IQ3 "
+                "(fmt=6, 4-byte tag)%s%s; refusing rather than guessing (untrusted "
+                "container, fmt=6 collision at I=98)%s\n",
+                name,O,I,(long long)nb,(long long)ns,
+                fp8_blk_also ? " AND per-128x128-block FP8 (fmt=100, single block)" : "",
+                i8_row_also  ? " AND plain int8 per-row (fmt=1, O=1)" : "",
+                stamped_name ? " -- metadata stamp present but names a format that doesn't resolve the ambiguity"
+                             : "");
+            exit(1);
+        }
+        *gs=0; return 6;
+    }
     /* Row formats take precedence: for tiny I the int3-g64 byte count can coincide with
      * a row layout (e.g. [O,48]: ceil(48/2)=24=1*24). For real tensor shapes the counts
      * are distinct, and the weight bytes — not the scale size — are the int3 tag, because

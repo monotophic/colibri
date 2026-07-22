@@ -134,6 +134,73 @@ static void test_disambiguation(void){
     CHECK(expect_refuse(10,10, 100, 999, "garbage ns matches neither row nor block layout"));
 }
 
+/* ---- Part A2: fmt=6 (E8/IQ3, upstream #465, merged into dev) vs fmt=100
+ * (this branch's fp8-e4m3-b128) collision -- SECOND DESIGN LANDMINE, see the
+ * derivation in qt_resolve_fmt's own comment and the build report's "THE
+ * SEMANTIC RECONCILIATION" section. e8_rowbytes(I) is the constant 98 for
+ * every I in (0,256], so dev's fmt=6 tag check (ns==4 && nb==O*e8_rowbytes(I))
+ * collapses to nb==O*98 -- which coincides with fp8-e4m3-b128's raw weight
+ * bytes (O*I) at the ONE value I==98, where a SINGLE-BLOCK (O<=128) fp8
+ * tensor also carries exactly one f32 block scale (ns==4, same as the E8
+ * tag). An unstamped [O<=128, I=98] fp8-e4m3-b128 tensor is therefore
+ * byte-for-byte indistinguishable from a genuine fmt=6 tensor at the same
+ * shape: nb AND ns both coincide, not just ns (contrast the fmt=1/fmt=100
+ * collision above, where only ns ever coincides). Must refuse loudly when
+ * unstamped, exactly like every other collision in this function; a stamp
+ * naming one specific candidate must resolve it in EITHER direction, and a
+ * genuine (non-colliding, I!=98) fmt=6 fixture must keep resolving to fmt=6
+ * with no stamp at all -- dev's own E8/IQ3 inference must stay unbroken. */
+static void test_fmt6_fp8_collision(void){
+    /* O=64, I=98: nblkO=nblkI=1 (fmt=100, single block) -> ns=4; e8_blocks(98)=1 ->
+     * nb=O*98=6272 for BOTH interpretations, and fmt=6's .qs tag is always exactly
+     * one f32 -> ns=4 too. Unstamped: must refuse, not silently pick either side. */
+    int64_t nb64=(int64_t)64*98;
+    CHECK(expect_refuse(64,98, nb64, 4, "fmt=6/fmt=100 collision O=64 I=98 (unstamped, both fit)"));
+    /* boundary O=128 variant: still nblkO=1 for fmt=100 (128<=128), same collision. */
+    int64_t nb128=(int64_t)128*98;
+    CHECK(expect_refuse(128,98, nb128, 4, "fmt=6/fmt=100 collision O=128 I=98 (unstamped, both fit)"));
+
+    /* stamped: the ONLY way to break this collision. Both directions must resolve
+     * to the STAMPED format, not whichever the byte-arithmetic-only check would
+     * have unconditionally picked (fmt=6, since it runs first in the function). */
+    CHECK(expect_fmt_stamped(64,98, nb64, 4, "fp8-e4m3-b128", 100,
+        "fmt=6/fmt=100 collision O=64 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=100"));
+    CHECK(expect_fmt_stamped(64,98, nb64, 4, "e8-iq3-lattice", 6,
+        "fmt=6/fmt=100 collision O=64 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
+    CHECK(expect_fmt_stamped(128,98, nb128, 4, "fp8-e4m3-b128", 100,
+        "fmt=6/fmt=100 collision O=128 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=100"));
+    CHECK(expect_fmt_stamped(128,98, nb128, 4, "e8-iq3-lattice", 6,
+        "fmt=6/fmt=100 collision O=128 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
+
+    /* a stamp naming something else entirely does NOT resolve the ambiguity --
+     * same "refuse rather than guess" posture as an absent stamp. */
+    CHECK(expect_refuse_stamped(64,98, nb64, 4, "int4-row",
+        "fmt=6/fmt=100 collision O=64 I=98, stamped with an UNRELATED format -> still refuses"));
+
+    /* O=1, I=98: a THIRD candidate stacks on (fmt=1 plain int8 per-row, ns==O*4==4
+     * too) -- a genuine three-way ambiguity. Unstamped refuses; stamped resolves
+     * to whichever of the three the stamp names. */
+    int64_t nb1=(int64_t)1*98;
+    CHECK(expect_refuse(1,98, nb1, 4, "fmt=1/fmt=6/fmt=100 THREE-way collision O=1 I=98 (unstamped)"));
+    CHECK(expect_fmt_stamped(1,98, nb1, 4, "int8-row", 1,
+        "three-way collision O=1 I=98, stamped int8-row -> resolves to fmt=1"));
+    CHECK(expect_fmt_stamped(1,98, nb1, 4, "fp8-e4m3-b128", 100,
+        "three-way collision O=1 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=100"));
+    CHECK(expect_fmt_stamped(1,98, nb1, 4, "e8-iq3-lattice", 6,
+        "three-way collision O=1 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
+
+    /* regression guard: a GENUINE (non-colliding) fmt=6 fixture -- I!=98, so
+     * e8_rowbytes(I)==98 does NOT equal O*I -- must keep resolving to fmt=6 with
+     * NO stamp at all. dev's own E8/IQ3 inference must stay unbroken by this
+     * reconciliation. Mirrors test_e8_kernel.c's own O=24,I=512 shape and a small
+     * single-super-block shape (I=256, inside the (0,256] range where
+     * e8_rowbytes(I)==98 but I!=98, so still non-colliding). */
+    CHECK(expect_fmt(24,512, (int64_t)24*e8_rowbytes(512), 4, 6,
+        "genuine fmt=6 (non-colliding) O=24 I=512, unstamped -> still resolves to fmt=6"));
+    CHECK(expect_fmt(64,256, (int64_t)64*e8_rowbytes(256), 4, 6,
+        "genuine fmt=6 (non-colliding) O=64 I=256 (I!=98, no collision), unstamped -> fmt=6"));
+}
+
 /* ---- Part B: qt_from_disk loader-seam (real safetensors file) ---- */
 
 static void deq_fmt100(const QT *t, float *dq){
@@ -396,6 +463,7 @@ static void test_stamp_absent(void){
 
 int main(void){
     test_disambiguation();
+    test_fmt6_fp8_collision();
     test_loader_seam();
     check_fp8_bytes(2048,6144, "qt_bytes fmt=100 gate/up-shaped O=2048 I=6144 (spec example)");
     check_fp8_bytes(6144,2048, "qt_bytes fmt=100 down-shaped O=6144 I=2048");
