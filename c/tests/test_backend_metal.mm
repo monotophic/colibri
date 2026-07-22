@@ -161,6 +161,33 @@ static int run_fp8_gemm_gate(const char *name) {
   return ok?0:1;
 }
 
+// colibri.c's moe() has a THIRD fmt=100-adjacent Metal entry point besides the two
+// guarded above (bind_gemv's attn/layer-decode shaders and coli_metal_gemm) -- the
+// batched routed-expert dispatch via coli_metal_moe_block[_begin] (colibri.c's
+// MB_BUILD macro). MB_BUILD's own pointer-selection ternary does NOT special-case
+// fmt=100: if a layer's shared expert is fmt=100 and MB_BUILD's TRY_SH path picks it
+// up with no routed expert already fixing `mfmt`, it would submit the WRONG pointer
+// (q4, NULL/stale for an fmt=100 tensor whose weights live in q8) tagged as fmt=100.
+// This is safe ANYWAY, but only incidentally: moe_submit() (backend_metal.mm) gates
+// `fmt != 1 && fmt != 2` as its very FIRST statement, before any of g/u/d/gs/us/ds is
+// dereferenced or even resolve()'d -- so an fmt=100 submission is refused before the
+// bad pointer would ever be read, no matter what garbage MB_BUILD packed into it. This
+// test uses deliberately-invalid weight/scale pointers (never dereferenced if the gate
+// holds) to prove the fence BY TEST rather than leaving it an artifact of moe_submit's
+// fmt allowlist happening not to include 100 (yet) -- same discipline
+// run_fp8_gemm_gate above applies to coli_metal_gemm's analogous exclusion.
+static int run_fp8_moe_gate(const char *name) {
+  const void *bad = (const void*)(uintptr_t)0xdeadbeef;   // must NEVER be dereferenced
+  const void *g[1] = {bad}, *u[1] = {bad}, *d[1] = {bad};
+  const float *gs[1] = {(const float*)bad}, *us[1] = {(const float*)bad}, *ds[1] = {(const float*)bad};
+  float xg[8]={0}, out[8]={0}, rw[1]={1.0f};
+  int xoff[1]={0}, nr[1]={1}, rows[1]={0};
+  int rc = coli_metal_moe_block(1, 8, 8, FP8, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, 1);
+  int ok = (rc == 0);
+  printf("  %-42s rc=%d (expect 0/CPU-fallback)  %s\n", name, rc, ok?"ok":"*** MISMATCH (should have refused)");
+  return ok?0:1;
+}
+
 static float deq4(const uint8_t* w,int i){ uint8_t b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); return (float)(v-8); }
 static size_t roundpg(size_t n){ size_t p=16384; return ((n+p-1)/p)*p; }
 
@@ -375,6 +402,7 @@ int main(void) {
   // scale and this shape/scale choice makes that numerically loud.
   fail |= run_fp8(384, 6144, 3, "fp8 non-square block grid nblkO=3 nblkI=48 (stride audit)");
   fail |= run_fp8_gemm_gate("fp8 GEMM entry explicitly gated off (coli_metal_gemm refuses)");
+  fail |= run_fp8_moe_gate("fp8 MB_BUILD/moe_submit entry gated off (shared-expert fmt=100 hazard)");
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");

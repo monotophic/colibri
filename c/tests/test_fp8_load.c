@@ -109,6 +109,11 @@ static void test_disambiguation(void){
     CHECK(expect_refuse(128,16384,128LL*16384, 512, "degenerate O=128 I=16384 (nblkO=1,nblkI=128=O)"));
     /* O>128 degenerate case: nblkO=2, need nblkI=O/2 -- O=256,I=16384 -> nblkI=128, 2*128=256=O */
     CHECK(expect_refuse(256,16384,256LL*16384, 1024, "degenerate O=256 I=16384 (nblkO=2,nblkI=128, product=O)"));
+    /* k=3: the ambiguity isn't a one-off O=256 coincidence -- it's structural for ANY
+     * O that's a multiple of 128 (nblkO=k), since nblkI==128 (I in (16256,16384]) always
+     * makes nblkO*nblkI == k*128 == O. One more multiple (O=384=3*128) confirms the
+     * condition generalizes past the k=2 worked example, not just a re-derivation. */
+    CHECK(expect_refuse(384,16384,384LL*16384, 1536, "degenerate O=384 I=16384 (nblkO=3,nblkI=128, k=3, product=O)"));
 
     /* --- boundary-ADJACENT non-degenerate cases: one step past each
      * degenerate case above, both interpretations now legitimately resolve. --- */
@@ -213,9 +218,187 @@ static void test_loader_seam(void){
     unlink(path); rmdir(dir);
 }
 
+/* ---- Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=100 ----
+ *
+ * qt_bytes() must not fall through to the fmt=2 (packed int4, O*ceil(I/2)+O*4)
+ * default -- for a real fp8 tensor that would undercount the resident byte
+ * count by roughly half (an AUTOPIN/RAM-budget-feeding hazard). qt_wire_mmap/
+ * qt_unwire_mmap must not hardcode scale_b=O*4 (per-row) either -- wrong for
+ * fmt=100's per-128x128-block scale array -- hence the dedicated
+ * qt_scale_bytes() helper shared by qt_bytes() and both wire functions so
+ * there is exactly one place that knows each format's scale geometry. This
+ * test exercises the arithmetic directly (no qt_from_disk/disk I/O, no mlock
+ * syscall -- qt_wire_mmap's actual mem_wire() call is environment-dependent
+ * (RLIMIT_MEMLOCK) and not what changed; the byte-count formula is) across
+ * the shapes already used elsewhere in this file plus a block-edge
+ * (non-128-multiple) case. */
+static void check_fp8_bytes(int O, int I, const char *tag){
+    QT t; memset(&t,0,sizeof t); t.fmt=100; t.O=O; t.I=I; t.gs=0;
+    int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I), nblk=nblkO*nblkI;
+    int64_t want_total = (int64_t)O*I + nblk*4;
+    int64_t want_scale = nblk*4;
+    int64_t got_total = qt_bytes(&t);
+    int64_t got_scale = qt_scale_bytes(&t);
+    if(got_total != want_total)
+        printf("FAIL %s: qt_bytes=%lld want=%lld\n", tag, (long long)got_total, (long long)want_total);
+    CHECK(got_total == want_total);
+    if(got_scale != want_scale)
+        printf("FAIL %s: qt_scale_bytes=%lld want=%lld\n", tag, (long long)got_scale, (long long)want_scale);
+    CHECK(got_scale == want_scale);
+    /* weight_b, as qt_wire_mmap/qt_unwire_mmap now compute it, must land on the exact
+     * O*I raw-byte weight region -- not short (partial mlock) or long (mlock past the
+     * allocation, undefined behavior) by even one byte. */
+    CHECK(got_total - got_scale == (int64_t)O*I);
+    /* regression guard: the fmt=2 (packed-nibble) formula must NOT be what fmt=100
+     * returns -- confirm the value has actually MOVED off it (catches a silent
+     * revert of the fmt==100 branch order/placement, not just a formula typo). For
+     * O=1,I=1 the two formulas coincide by coincidence (both give 1+4=5), so that
+     * shape is skipped for this particular guard -- the other three shapes below are
+     * chosen to avoid the coincidence. */
+    int64_t old_wrong = (int64_t)O*((I+1)/2) + (int64_t)O*4;
+    if(!(O==1 && I==1)) CHECK(got_total != old_wrong);
+}
+
+/* ---- Part D: metadata-stamp TRUST-VERIFY-REFUSE (qt_verify_fmt_stamp, colibri.c) ----
+ * The stamp lives in the safetensors __metadata__["colibri.fmt"] value -- itself
+ * JSON text (a {tensor_name: format_name} map, matching what
+ * tools/repack_fp8_passthrough.py writes and st_fmt_stamp_ingest (st.h) parses).
+ * Three outcomes: an AGREEING stamp is a silent no-op (loads exactly as it would
+ * unstamped); a MISMATCHING stamp (a recognized name naming a DIFFERENT format,
+ * or a name this build doesn't recognize at all) refuses (exit(1)); an UNSTAMPED
+ * container (no __metadata__ block at all) infers exactly as before this
+ * feature existed -- already exercised incidentally by every Part B/C fixture
+ * above (none of them write __metadata__), but given an explicit case here too
+ * so all three outcomes live together, self-documenting. */
+
+/* Writes a single-tensor fp8 shard (O=8,I=256 -> nblkO=1,nblkI=2, the same
+ * non-degenerate shape Part B's w100 fixture uses) with an OPTIONAL __metadata__
+ * block. `meta_json_string_literal`, if non-NULL, must already be a quoted/
+ * escaped JSON STRING TOKEN placed verbatim after "colibri.fmt": in the header
+ * -- callers pass a C string literal like "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\""
+ * so the raw header bytes end up with colibri.fmt's VALUE being the JSON text
+ * {"w":"fp8-e4m3-b128"} (double-JSON-encoded: a JSON string whose CONTENT is
+ * itself JSON -- exactly what safetensors.save_file(metadata=...) produces,
+ * since __metadata__ values must be plain strings). */
+static void write_stamp_fixture(const char *dir, const char *meta_json_string_literal){
+#ifdef _WIN32
+    mkdir(dir);
+#else
+    mkdir(dir,0755);
+#endif
+    enum { O=8, I=256 };
+    enum { NBLK = CDIV(O,128) * CDIV(I,128) };
+    static uint8_t q[O*I]; static float s[NBLK];
+    for(int i=0;i<O*I;i++) q[i]=rndbyte_nonan();
+    for(int i=0;i<NBLK;i++) s[i]=0.01f+0.001f*(float)i;
+    char path[300]; snprintf(path,sizeof path,"%s/model.safetensors",dir);
+    int64_t nb=(int64_t)O*I, ns=(int64_t)sizeof(s);
+    char hdr[2048]; int hl;
+    if(meta_json_string_literal)
+        hl=snprintf(hdr,sizeof hdr,
+            "{\"__metadata__\":{\"colibri.fmt\":%s},"
+            "\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+            "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+            meta_json_string_literal,
+            (long long)nb,(long long)nb,
+            (long long)(ns/4),(long long)nb,(long long)(nb+ns));
+    else
+        hl=snprintf(hdr,sizeof hdr,
+            "{\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+            "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+            (long long)nb,(long long)nb,
+            (long long)(ns/4),(long long)nb,(long long)(nb+ns));
+    FILE *f=fopen(path,"wb");
+    if(!f){ printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path); fails++; return; }
+    uint64_t hlen=(uint64_t)hl;
+    fwrite(&hlen,8,1,f); fwrite(hdr,1,hl,f);
+    fwrite(q,1,(size_t)nb,f); fwrite(s,1,(size_t)ns,f);
+    fclose(f);
+}
+
+/* Fork+waitpid, mirroring expect_refuse above: st_init+qt_from_disk run in the
+ * child (isolating a parsed-and-possibly-poisoned `shards` struct from the
+ * rest of the suite) and must exit(1) with a "refus"-containing stderr message. */
+static int expect_stamp_refuse(const char *dir, const char *tag){
+    int pipefd[2]; if(pipe(pipefd)!=0) return 0;
+    pid_t pid = fork();
+    if(pid < 0) return 0;
+    if(pid == 0){
+        dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
+        static Model gm; memset(&gm,0,sizeof gm);
+        st_init(&gm.S, dir);
+        QT t; memset(&t,0,sizeof t);
+        qt_from_disk(&gm,"w",8,256,8,0,&t);   /* must exit(1) inside qt_verify_fmt_stamp */
+        _exit(42);                             /* reaching here is the bug */
+    }
+    close(pipefd[1]);
+    char err[1024]={0}; ssize_t n=read(pipefd[0],err,sizeof(err)-1); (void)n;
+    close(pipefd[0]);
+    int status=0; waitpid(pid,&status,0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
+    if(!ok){
+        printf("FAIL %s: expected exit(1) refusal, got status=%d, stderr=%.200s\n", tag, status, err);
+        return 0;
+    }
+    if(!strstr(err,"refus")){
+        printf("FAIL %s: exited(1) but message lacked a refusal explanation: %.200s\n", tag, err);
+        return 0;
+    }
+    return 1;
+}
+
+static void test_stamp_agreeing(void){
+    const char *dir="tests/tmp_fp8_stamp_agree";
+    write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
+    static Model gm; memset(&gm,0,sizeof gm);
+    st_init(&gm.S, dir);
+    QT t; memset(&t,0,sizeof t);
+    qt_from_disk(&gm,"w",8,256,8,0,&t);
+    CHECK(t.fmt==100);                 /* stamp agreed -- loads exactly as unstamped would */
+    CHECK(t.q8!=NULL && t.s!=NULL);
+    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+}
+
+static void test_stamp_mismatching(void){
+    const char *dir="tests/tmp_fp8_stamp_mismatch";
+    /* byte-arithmetic says fmt=100 (fp8); the stamp names a REAL, recognized,
+     * but DIFFERENT format -- exercises "found but disagrees", not just "name
+     * not found at all" (see test_stamp_unrecognized_name below for that case). */
+    write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"int8-row\\\"}\"");
+    CHECK(expect_stamp_refuse(dir, "stamped-mismatching: stamp says int8-row, bytes say fp8-e4m3-b128"));
+    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+}
+
+static void test_stamp_unrecognized_name(void){
+    const char *dir="tests/tmp_fp8_stamp_unknown";
+    write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"quantum-format-9000\\\"}\"");
+    CHECK(expect_stamp_refuse(dir, "stamped with a format name this build doesn't recognize"));
+    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+}
+
+static void test_stamp_absent(void){
+    const char *dir="tests/tmp_fp8_stamp_absent";
+    write_stamp_fixture(dir, NULL);       /* no __metadata__ block at all */
+    static Model gm; memset(&gm,0,sizeof gm);
+    st_init(&gm.S, dir);
+    QT t; memset(&t,0,sizeof t);
+    qt_from_disk(&gm,"w",8,256,8,0,&t);
+    CHECK(t.fmt==100);                 /* unstamped: byte-arithmetic inference alone decides */
+    CHECK(t.q8!=NULL && t.s!=NULL);
+    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+}
+
 int main(void){
     test_disambiguation();
     test_loader_seam();
+    check_fp8_bytes(2048,6144, "qt_bytes fmt=100 gate/up-shaped O=2048 I=6144 (spec example)");
+    check_fp8_bytes(6144,2048, "qt_bytes fmt=100 down-shaped O=6144 I=2048");
+    check_fp8_bytes(130,200,   "qt_bytes fmt=100 block edges O,I both non-mult-128");
+    check_fp8_bytes(1,1,       "qt_bytes fmt=100 degenerate 1x1");
+    test_stamp_agreeing();
+    test_stamp_mismatching();
+    test_stamp_unrecognized_name();
+    test_stamp_absent();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
     printf("fp8 loader-seam tests: ok\n");
     return 0;

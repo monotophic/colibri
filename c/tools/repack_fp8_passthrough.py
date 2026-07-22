@@ -50,6 +50,22 @@ checkpoint layout) plus --dry-run inventory mode against those same fixtures.
 NO read of any real Z.ai shard, NO full or partial repack of a real checkpoint
 -- that is later, user-GO'd work once this build's plumbing has been reviewed.
 
+METADATA STAMP (reference implementation of the FORMATS-registry FR -- see
+upstream_contribution/FORMATS_registry_draft.md): every output shard's
+safetensors `__metadata__` carries a `colibri.fmt` key whose VALUE is itself a
+JSON-encoded object mapping each stamped tensor's exact name to its format
+NAME string (FORMAT_NAME below, "fp8-e4m3-b128" -- never the private ordinal
+100, which is an internal enum value the container must never depend on, see
+colibri.c's PRIVATE ORDINAL BLOCK comment). The reader (qt_from_disk's
+qt_verify_fmt_stamp, colibri.c) is TRUST-VERIFY-REFUSE: a stamp that agrees
+with the byte-arithmetic inference is a no-op (the tensor loads exactly as it
+would unstamped); a stamp that disagrees, or names a format this build
+doesn't recognize, is refused loudly (same "untrusted container" discipline
+as qt_resolve_fmt's own THE DESIGN LANDMINE refusal). Unstamped containers
+(everything this tool produced before this stamp existed, and any container
+from a tool that doesn't stamp) are unaffected: no stamp means inference
+alone decides, exactly as before this feature existed.
+
 Usage (synthetic fixtures / local testing only):
   python3 tools/repack_fp8_passthrough.py --indir <fp8_dir> --outdir <out> --dry-run
   python3 tools/repack_fp8_passthrough.py --indir <fp8_dir> --outdir <out> --n-layers 78
@@ -66,6 +82,18 @@ from convert_fp8_to_int4 import classify, check_or_record_params  # reuse: same 
 # ALSO excluded -- see the module docstring: the CPU absorb path (qt_addrow/
 # qt_matvec_rows) and the CUDA absorb kernels have no fmt=100 case yet.
 RESIDENT_KINDS = frozenset({"sh", "o", "attn", "dmlp", "q"})
+
+# The format's PUBLIC identity (what containers/FRs advertise) -- never the
+# private 100 ordinal, which is an internal-only enum value (see colibri.c's
+# QT struct comment, PRIVATE ORDINAL BLOCK). Must match the reader's
+# FMT_NAMES table (colibri.c, near qt_resolve_fmt) or every stamp this tool
+# writes will be refused as "unrecognized format name" on load.
+FORMAT_NAME = "fp8-e4m3-b128"
+
+# safetensors __metadata__ key this tool stamps: JSON-encoded {tensor_name:
+# format_name}. Kept as a module constant so the reader-side doc and any
+# future tooling can cite the exact string instead of re-typing it.
+METADATA_KEY = "colibri.fmt"
 
 BLOCK = 128
 
@@ -133,11 +161,17 @@ def repack_shard(path, n_layers):
     byte-identical against torch.float8_e4m3fn's own storage) and rename/flatten
     the `_scale_inv` sidecar to the engine's `name.qs` convention (flat F32,
     nblkO*nblkI elements, row-major [blkO,blkI] -- matching
-    scale[(o/128)*nblkI+i/128] on the read side). Returns (out_dict, inventory)."""
+    scale[(o/128)*nblkI+i/128] on the read side). Returns (out_dict, inventory,
+    fmt_map): fmt_map is {weight_tensor_name: FORMAT_NAME} for every selected
+    tensor -- the caller JSON-encodes it into the output shard's __metadata__
+    (see the module docstring's METADATA STAMP section). Keyed by the WEIGHT
+    name only (not the ".qs" sidecar) -- that's the name qt_resolve_fmt/
+    qt_verify_fmt_stamp look the stamp up by on the read side."""
     import torch
     from safetensors import safe_open
     out = {}
     inv = []
+    fmt_map = {}
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
         for name in f.keys():
@@ -152,10 +186,11 @@ def repack_shard(path, n_layers):
             _check_geometry(name, O, I, nblkO, nblkI)
             out[name] = w.view(torch.uint8).contiguous()              # BYTE-PRESERVED
             out[name + ".qs"] = sc.to(torch.float32).reshape(-1).contiguous()
+            fmt_map[name] = FORMAT_NAME
             inv.append({"name": name, "kind": classify(name, n_layers),
                        "O": O, "I": I, "nblkO": nblkO, "nblkI": nblkI,
                        "weight_bytes": O * I, "scale_bytes": nblkO * nblkI * 4})
-    return out, inv
+    return out, inv, fmt_map
 
 
 def _print_inventory_summary(all_inv, dry_run):
@@ -231,13 +266,18 @@ def main():
                 n += 1
             skipped += 1
             continue
-        out, inv = repack_shard(sp, a.n_layers)
+        out, inv, fmt_map = repack_shard(sp, a.n_layers)
         all_inv.extend(inv)
         if not out:
             done[key] = ""
         else:
             name = f"out-fp8pass-{n:05d}.safetensors"
-            save_file(out, os.path.join(a.outdir, name))
+            # METADATA STAMP: __metadata__ values must be strings (safetensors
+            # constraint) -- colibri.fmt's VALUE is itself JSON text (a map of
+            # tensor name -> format NAME), not a nested object, for exactly
+            # that reason. sort_keys for a deterministic, diffable stamp.
+            meta = {METADATA_KEY: json.dumps(fmt_map, sort_keys=True)}
+            save_file(out, os.path.join(a.outdir, name), metadata=meta)
             done[key] = name
             n += 1
             fresh += 1

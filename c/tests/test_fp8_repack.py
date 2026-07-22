@@ -121,7 +121,7 @@ class SelectionTest(unittest.TestCase):
         self.assertNotIn("model.layers.0.mlp.gate.weight", names)     # router, f32 kind
 
     def test_byte_preservation_and_qs_rename(self):
-        out, inv = rp.repack_shard(self.shard, n_layers=5)
+        out, inv, fmt_map = rp.repack_shard(self.shard, n_layers=5)
         self.assertEqual(len(inv), 4)
         with safe_open(self.shard, framework="pt") as f:
             for it in inv:
@@ -134,6 +134,17 @@ class SelectionTest(unittest.TestCase):
                 O, I_ = w_src.shape
                 nblkO, nblkI = (O + 127) // 128, (I_ + 127) // 128
                 self.assertEqual(out[name + ".qs"].numel(), nblkO * nblkI)
+
+    def test_fmt_map_covers_every_selected_tensor(self):
+        """fmt_map is the pre-JSON-encoding form of the __metadata__ stamp: exactly
+        one entry per selected WEIGHT tensor (never the .qs sidecar), all mapped to
+        the format's public NAME string -- never the private ordinal (100)."""
+        out, inv, fmt_map = rp.repack_shard(self.shard, n_layers=5)
+        names = {it["name"] for it in inv}
+        self.assertEqual(set(fmt_map.keys()), names)
+        for name in names:
+            self.assertEqual(fmt_map[name], rp.FORMAT_NAME)
+        self.assertNotIn(next(iter(names)) + ".qs", fmt_map)
 
     def test_geometry_refusal_on_malformed_scale(self):
         """A shard whose _scale_inv shape doesn't match ceil(O/128)xceil(I/128) for
@@ -186,6 +197,24 @@ class ResumeAndParamsGuardTest(unittest.TestCase):
         self.assertNotIn("model.embed_tokens.weight", hdr)
         self.assertNotIn("model.layers.0.input_layernorm.weight", hdr)
         self.assertNotIn("model.layers.0.self_attn.kv_b_proj.weight", hdr)
+
+    def test_metadata_stamp_present_and_matches_selection(self):
+        """End-to-end (through the CLI, real safetensors write) check of the
+        __metadata__ stamp the reader (colibri.c's qt_verify_fmt_stamp) trusts:
+        colibri.fmt must be present, must itself parse as JSON, and must map
+        exactly the selected tensor names (never their .qs sidecars) to the
+        format's public NAME -- never the private ordinal."""
+        self.assertEqual(self._run(5), 0)
+        outs = glob.glob(os.path.join(self.outdir, "out-fp8pass-*.safetensors"))
+        hdr = _read_header(outs[0])
+        self.assertIn("__metadata__", hdr)
+        self.assertIn("colibri.fmt", hdr["__metadata__"])
+        stamp = json.loads(hdr["__metadata__"]["colibri.fmt"])
+        tensor_names = {k for k in hdr if k != "__metadata__" and not k.endswith(".qs")}
+        self.assertEqual(set(stamp.keys()), tensor_names)
+        for name, fmt_name in stamp.items():
+            self.assertEqual(fmt_name, rp.FORMAT_NAME)
+            self.assertNotEqual(fmt_name, "100", f"{name}: stamp must carry the NAME, not the private ordinal")
 
     def test_resume_skips_completed_shard(self):
         self.assertEqual(self._run(5), 0)

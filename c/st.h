@@ -47,6 +47,20 @@ typedef struct {
                            * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
                            * costava decine di secondi/token (misurato sul primo run reale) */
     int        hcap;
+    /* FORMAT METADATA STAMP (reference impl, see colibri.c's qt_verify_fmt_stamp):
+     * per-tensor {name -> format NAME string} pairs collected from every shard's
+     * __metadata__["colibri.fmt"] JSON blob (safetensors __metadata__ values are
+     * always strings, so colibri.fmt's value is itself JSON text, parsed a
+     * second time -- see st_init_multi below). Small in practice (only the
+     * tensors a stamping tool selected, a subset of S->t), so a flat array +
+     * linear st_fmt_stamp() lookup is fine; this is a reference implementation,
+     * not a framework -- no hash map for a handful-to-low-thousands of entries.
+     * Both arrays own strdup'd strings, intentionally leaked like the rest of
+     * st_init_multi's one-time startup parsing (see the json_parse callers
+     * below). */
+    char     **fmt_name;   /* stamped tensor name */
+    char     **fmt_val;    /* stamped format NAME string */
+    int        fmt_n, fmt_cap;
 } shards;
 #define ST_MAX_SHARDS 512
 
@@ -210,6 +224,60 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     }
 }
 
+/* Parses one shard's __metadata__["colibri.fmt"] value (a safetensors metadata
+ * value is always a plain string, so colibri.fmt's VALUE is itself JSON text --
+ * a flat {tensor_name: format_name} object -- parsed a second time here) and
+ * appends every entry to S->fmt_name/fmt_val. Absent __metadata__, or a
+ * __metadata__ without a colibri.fmt key, is NOT an error: that's simply an
+ * unstamped container, and byte-arithmetic inference alone decides, exactly as
+ * before this feature existed (see qt_verify_fmt_stamp in colibri.c). A
+ * colibri.fmt key that IS present but doesn't parse into that shape is refused
+ * loudly -- same "untrusted container" discipline qt_resolve_fmt applies
+ * elsewhere: a stamp the engine cannot make sense of must not be silently
+ * ignored (that would be indistinguishable from a real mismatch going
+ * unnoticed). */
+static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
+    jval *meta = json_get(root, "__metadata__");
+    if (!meta || meta->t != J_OBJ) return;                /* no metadata object: unstamped, fine */
+    jval *stamp = json_get(meta, "colibri.fmt");
+    if (!stamp) return;                                    /* no stamp key: unstamped, fine */
+    if (stamp->t != J_STR) {
+        fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted container)\n",
+                shard_path); exit(1); }
+    char *arena2 = NULL;
+    jval *inner = json_parse(stamp->str, &arena2);
+    if (!inner || inner->t != J_OBJ) {
+        fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing (untrusted container)\n",
+                shard_path); exit(1); }
+    for (int i = 0; i < inner->len; i++) {
+        jval *v = inner->kids[i];
+        if (v->t != J_STR) {
+            fprintf(stderr, "%s: colibri.fmt entry '%s' is not a string -- malformed stamp, refusing (untrusted container)\n",
+                    shard_path, inner->keys[i]); exit(1); }
+        if (S->fmt_n == S->fmt_cap) {
+            S->fmt_cap = S->fmt_cap ? S->fmt_cap * 2 : 16;
+            S->fmt_name = realloc(S->fmt_name, S->fmt_cap * sizeof(char*));
+            S->fmt_val  = realloc(S->fmt_val,  S->fmt_cap * sizeof(char*));
+        }
+        S->fmt_name[S->fmt_n] = strdup(inner->keys[i]);
+        S->fmt_val[S->fmt_n]  = strdup(v->str);
+        S->fmt_n++;
+    }
+    free(arena2);  /* always NULL (json_parse never populates it -- see j_dup); the jval
+                    * tree itself is intentionally leaked, same one-time-startup convention
+                    * as st_init_multi's own root parse a few lines below. */
+}
+
+/* Stamped format NAME for `name`, or NULL if this tensor carries no stamp
+ * (either because no shard stamped it, or the container predates this
+ * feature). Linear scan: S->fmt_n is a subset of S->n (only stamped tensors),
+ * small in practice -- see the shards struct comment. */
+static const char *st_fmt_stamp(shards *S, const char *name) {
+    for (int i = 0; i < S->fmt_n; i++)
+        if (!strcmp(S->fmt_name[i], name)) return S->fmt_val[i];
+    return NULL;
+}
+
 /* Scan one directory for *.safetensors shards, appending to files[] (dedup by
  * basename, so a list of directories acts as a SEARCH PATH: the same shard
  * present on two drives is taken from the first-listed one only). *added
@@ -296,6 +364,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         jval *root = json_parse(hdr, &arena);
         if (!root || root->t != J_OBJ) {
             fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
+        st_fmt_stamp_ingest(S, root, files[fi]);
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
             if (!strcmp(name, "__metadata__")) continue;
